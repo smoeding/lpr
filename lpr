@@ -33,7 +33,11 @@ use Getopt::Std;
 use IO::Socket::INET;
 
 
-my $printer = '10.130.94.120:9100'; # JetDirect port
+#
+# Config
+#
+my $printer = '10.130.94.120';  # Printer IP
+my $port    = '9100';           # JetDirect port
 
 
 #
@@ -46,6 +50,9 @@ my $printer = '10.130.94.120:9100'; # JetDirect port
 my %opts = ();
 
 getopts('J:T:P:', \%opts) or die "lpr: failed to parse arguments";
+
+# Complete network address for IO::Socket::INET
+$printer .= ":${port}";
 
 
 #
