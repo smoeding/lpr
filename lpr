@@ -134,7 +134,7 @@ __END__
 
 =head1 NAME
 
-lpr - print directly to a JetDirect capable network printer
+lpr - print directly to a JetDirect compatible network printer
 
 =cut
 
