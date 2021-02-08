@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 #
-# Copyright (c) 2017 Stefan Möding <stm@kill-9.net>
+# Copyright (c) 2017-2021 Stefan Möding <stm@kill-9.net>
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -31,13 +31,18 @@ use warnings;
 
 use Getopt::Std;
 use IO::Socket::INET;
+use File::Temp qw/ :seekable /;
 
 
 #
 # Config
 #
-my $printer = '10.130.94.120';  # Printer IP
-my $port    = '9100';           # JetDirect port
+my $peer_addr = '192.168.1.251';  # Printer IP
+my $peer_port = '9100';           # JetDirect port
+my $papersize = 'a4';
+
+# Complete network address for IO::Socket::INET
+my $peer = "${peer_addr}:${peer_port}";
 
 
 #
@@ -51,28 +56,184 @@ my %opts = ();
 
 getopts('J:T:P:', \%opts) or die "lpr: failed to parse arguments";
 
-# Complete network address for IO::Socket::INET
-$printer .= ":${port}";
+# Set printer if given on commandline or use default otherwise
+my $printer = defined($opts{'P'}) ? $opts{'P'} : 'ps';
 
 
 #
-# Get data
+# Create a temporary file for stdin if no files are given on the commandline
 #
-if ($#ARGV >= 0) {
-  # Files given on commandline
-  foreach my $file (@ARGV) {
-    open(FILE, '<', $file) or die "lpr: can't open ${file}";
-    my $data = do { local $/; <FILE> };
-    close(FILE);
+if ($#ARGV < 0) {
+  # Store filehandle for temporary stdin file in module variable to prevent
+  # premature closing of the filehande.
+  our $stdin_copy = stdin2file();
 
-    &spool($printer, $data);
-  }
+  push @ARGV, $stdin_copy->filename;
 }
-else {
-  # No files given on commandline, so use STDIN
-  my $data = do { local $/; <STDIN> };
 
-  &spool($printer, $data);
+
+#
+# Process all files
+#
+foreach my $file (@ARGV) {
+  my $typ = filetype($file);
+  my $out = undef;
+
+  if ($typ eq 'PostScript' && $printer eq 'deskjet') {
+    $out  = ps2deskjet($file);
+    $file = $out->filename;
+  }
+  elsif ($typ eq 'Text' && $printer eq 'deskjet') {
+    $out  = text2deskjet($file);
+    $file = $out->filename;
+  }
+  elsif ($typ eq 'PostScript' && $printer eq 'ps') {
+    $out  = ps2ps($file);
+    $file = $out->filename;
+  }
+
+  open my $fd, '<', $file or die "lpr: ${out}: $!";
+  &spool($peer, $fd);
+  close $fd;
+}
+
+
+########################################################################
+#
+#
+#
+sub filetype {
+  my $file   = shift;
+  my $esc    = chr(27);
+  my $buffer;
+
+  open my $fd, '<', $file or die "lpr: ${file}: $!";
+  read($fd, $buffer, 8);
+  close $fd;
+
+  return 'PostScript' if ($buffer =~ /^%!PS/);
+  return 'PCL' if ($buffer =~ /^${esc}E/);
+  return 'Text';
+}
+
+########################################################################
+#
+#
+#
+sub ps2deskjet {
+  my $psfile = shift;
+  my $buffer;
+  my $handle = File::Temp->new();
+
+  binmode($handle);
+
+  my @command = ('gs', '-q', '-sDEVICE=deskjet', '-r600', '-P-',
+                 '-dBATCH', '-dNOSAFER', '-dNOPAUSE',
+                 "-sPAPERSIZE=${papersize}", '-sOutputFile=-', $psfile);
+
+  open my $pipe, '-|', @command or die "lpr: ${psfile}: $!";
+
+  # Copy from pipe output to temporary file
+  while ((read($pipe, $buffer, 8192)) != 0) {
+    print $handle $buffer;
+  }
+
+  close $pipe;
+
+  # Rewind filehandle
+  $handle->seek(0, SEEK_SET);
+
+  $handle;
+}
+
+
+########################################################################
+#
+#
+#
+sub text2deskjet {
+  my $textfile = shift;
+  my $buffer;
+  my $handle = File::Temp->new();
+
+  binmode($handle);
+
+  my @command = ('gs', '-q', '-sDEVICE=deskjet', '-r600', '-P-',
+                 '-dBATCH', '-dNOSAFER', '-dNOPAUSE',
+                 "-sPAPERSIZE=${papersize}", '-sOutputFile=-',
+                 '--', 'gslp.ps', $textfile);
+
+  open my $pipe, '-|', @command or die "lpr: ${textfile}: $!";
+
+  # Copy from pipe output to temporary file
+  while ((read($pipe, $buffer, 8192)) != 0) {
+    print $handle $buffer;
+  }
+
+  close $pipe;
+
+  # Rewind filehandle
+  $handle->seek(0, SEEK_SET);
+
+  $handle;
+}
+
+
+########################################################################
+#
+#
+#
+sub ps2ps {
+  my $psfile = shift;
+  my $esc    = chr(27);
+  my $eot    = chr(4);
+  my $buffer;
+  my $handle = File::Temp->new();
+
+  binmode($handle);
+
+  # Switch to PostScript
+  print $handle $esc . '%-12345X@PJL' . " \n";
+  print $handle '@PJL SET DUPLEX = ON' . " \n";
+  print $handle '@PJL ENTER LANGUAGE = POSTSCRIPT' . " \n";
+
+  open my $fd, '<', $psfile or die "lpr: ${psfile}: $!";
+
+  while ((read($fd, $buffer, 8192)) != 0) {
+    print $handle $buffer;
+  }
+
+  close $fd;
+
+  # ^D indicates end of PostScript
+  print $handle $eot;
+  print $handle $esc . '%-12345X';
+
+  # Rewind filehandle
+  $handle->seek(0, SEEK_SET);
+
+  $handle;
+}
+
+########################################################################
+#
+# stdin2file subroutine
+#
+sub stdin2file {
+  my $buffer;
+  my $handle = File::Temp->new();
+
+  binmode($handle);
+
+  # Copy from stdin to temporary file
+  while ((read(STDIN, $buffer, 8192)) != 0) {
+    print $handle $buffer;
+  }
+
+  # Rewind filehandle
+  $handle->seek(0, SEEK_SET);
+
+  $handle;
 }
 
 
@@ -81,54 +242,34 @@ else {
 # spool subroutine
 #
 sub spool {
-  my $printer = shift;
-  my $data    = shift;
+  my $peer    = shift;
+  my $handle  = shift;
   my $dry_run = 0;
-  my $esc     = chr(27);
-  my $eot     = chr(4);
-  my $pjl     = '@PJL';
-
-  die "lpr: nothing to print\n" unless (length($data) > 0);
+  my $buffer;
 
   if ($dry_run == 1) {
-    open(FD, '>', '/tmp/lpr.out');
-    print FD $data;
-    close(FD);
-    return;
-  }
+    open my $out, '>', '/tmp/lpr.out' or die "lpr: $!";
 
-  #
-  # Push data to raw printer port
-  #
+    while ((read($handle, $buffer, 8192)) != 0) {
+      print $out $buffer;
+    }
 
-  my $socket = new IO::Socket::INET(PeerAddr => $printer, Proto => 'tcp');
-
-  die "lpr: can't connect to printer: $!" unless $socket;
-
-  if ($data =~ /^%!PS/) {
-    # Switch to PostScript
-    $socket->send($esc . "%-12345X${pjl} \n");
-    $socket->send("${pjl} SET DUPLEX = ON \n");
-    $socket->send("${pjl} ENTER LANGUAGE = POSTSCRIPT \n");
-
-    $socket->send($data);
-
-    # ^D indicates end of PostScript
-    $socket->send(${eot});
-
-    $socket->send($esc . '%-12345X');
+    close $out;
   }
   else {
-    # No PostScript, maybe text?
-    $data =~ s/\r?\n/\r\n/g;      # Ensure CRLF
-    $socket->send($data);
-  }
+    # Push data to raw printer port
+    my $socket = new IO::Socket::INET(PeerAddr => $peer, Proto => 'tcp');
 
-  #
-  # Close socket
-  #
-  shutdown($socket, 1);
-  $socket->close();
+    die "lpr: can't connect to printer: $!" unless $socket;
+
+    while ((read($handle, $buffer, 8192)) != 0) {
+      print $socket $buffer;
+    }
+
+    # Close socket
+    shutdown($socket, 1);
+    $socket->close();
+  }
 }
 
 exit 0;
